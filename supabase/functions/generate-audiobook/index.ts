@@ -135,6 +135,7 @@ async function getLatestJob(supabase: ReturnType<typeof createClient>, bookId: s
 async function finalizeJob(
   supabase: ReturnType<typeof createClient>,
   jobId: string,
+  bookId: string,
   processedPages: number,
   totalPages: number,
   errorMessage?: string | null,
@@ -143,7 +144,7 @@ async function finalizeJob(
     .from('audiobook_text')
     .select('*', { count: 'exact', head: true })
     .eq('tts_status', 'completed')
-    .eq('book_id', jobId);
+    .eq('book_id', bookId);
 
   const hasSuccess = Boolean((count || 0) > 0);
   const finalStatus = hasSuccess
@@ -488,7 +489,7 @@ serve(async (req) => {
     const nextIndex = processedPages;
 
     if (nextIndex >= totalPages) {
-      const finalStatus = await finalizeJob(supabase, job.id, processedPages, totalPages, job.error_message);
+      const finalStatus = await finalizeJob(supabase, job.id, bookId, processedPages, totalPages, job.error_message);
       return respond({
         success: true,
         ok: true,
@@ -525,7 +526,7 @@ serve(async (req) => {
 
     let nextStatus = 'processing';
     if (isLastChunk) {
-      nextStatus = await finalizeJob(supabase, job.id, nextProcessedPages, totalPages, nextErrorMessage);
+      nextStatus = await finalizeJob(supabase, job.id, bookId, nextProcessedPages, totalPages, nextErrorMessage);
     } else {
       await supabase
         .from('audiobook_jobs')
