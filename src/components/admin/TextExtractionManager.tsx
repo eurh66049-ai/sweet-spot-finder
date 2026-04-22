@@ -73,8 +73,8 @@ const TextExtractionManager: React.FC = () => {
           extraction_error: ext?.extraction_error || null,
         };
       }).sort((a, b) => {
-        const aCompleted = a.extraction_status === 'completed' ? 1 : 0;
-        const bCompleted = b.extraction_status === 'completed' ? 1 : 0;
+        const aCompleted = a.extraction_status === 'completed' && (a.text_length || 0) > 0 ? 1 : 0;
+        const bCompleted = b.extraction_status === 'completed' && (b.text_length || 0) > 0 ? 1 : 0;
         return aCompleted - bCompleted;
       });
 
@@ -119,7 +119,7 @@ const TextExtractionManager: React.FC = () => {
   // === استخراج تلقائي لكل الكتب الناقصة ===
   const startBulkExtraction = async () => {
     const pending = books.filter(
-      b => b.extraction_status !== 'completed' && b.book_file_url
+      b => !(b.extraction_status === 'completed' && (b.text_length || 0) > 0) && b.book_file_url
     );
 
     if (pending.length === 0) {
@@ -213,11 +213,11 @@ const TextExtractionManager: React.FC = () => {
   }, [books, deferredQuery]);
 
   const pendingCount = useMemo(
-    () => books.filter(b => b.extraction_status !== 'completed' && b.book_file_url).length,
+    () => books.filter(b => !(b.extraction_status === 'completed' && (b.text_length || 0) > 0) && b.book_file_url).length,
     [books]
   );
   const completedCount = useMemo(
-    () => books.filter(b => b.extraction_status === 'completed').length,
+    () => books.filter(b => b.extraction_status === 'completed' && (b.text_length || 0) > 0).length,
     [books]
   );
 
