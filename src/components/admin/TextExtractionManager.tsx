@@ -23,6 +23,7 @@ interface BookWithExtraction {
 }
 
 type BulkState = 'idle' | 'running' | 'paused';
+const BULK_EXTRACTION_CONCURRENCY = 12;
 
 const TextExtractionManager: React.FC = () => {
   const [books, setBooks] = useState<BookWithExtraction[]>([]);
@@ -158,22 +159,40 @@ const TextExtractionManager: React.FC = () => {
 
     let done = 0;
     let failed = 0;
+    let nextIndex = 0;
     setProcessingBookIds(new Set(pending.map(book => book.id)));
 
-    await Promise.all(
-      pending.map(async (book) => {
+    const waitWhilePaused = async () => {
+      while ((bulkStateRef.current as BulkState) === 'paused') {
+        await new Promise(resolve => setTimeout(resolve, 500));
+      }
+    };
+
+    const runWorker = async () => {
+      while ((bulkStateRef.current as BulkState) !== 'idle') {
+        await waitWhilePaused();
         if ((bulkStateRef.current as BulkState) === 'idle') return;
+
+        const book = pending[nextIndex];
+        nextIndex++;
+        if (!book) return;
+
         setBulkProgress(p => ({ ...p, currentTitle: book.title }));
         const res = await extractText(book.id);
         if (res.ok) done++;
         else failed++;
+
         setProcessingBookIds(prev => {
           const next = new Set(prev);
           next.delete(book.id);
           return next;
         });
         setBulkProgress({ done: done + failed, total: pending.length, failed, currentTitle: book.title });
-      })
+      }
+    };
+
+    await Promise.all(
+      Array.from({ length: Math.min(BULK_EXTRACTION_CONCURRENCY, pending.length) }, () => runWorker())
     );
 
     bulkStateRef.current = 'idle';
