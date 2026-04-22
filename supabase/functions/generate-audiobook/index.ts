@@ -233,9 +233,9 @@ serve(async (req) => {
         audioBuffer[j] = binaryString.charCodeAt(j);
       }
 
-      const fileName = `audiobooks/_tests/test_${Date.now()}.mp3`;
+      const fileName = `_tests/test_${Date.now()}.mp3`;
       const { error: uploadError } = await supabase.storage
-        .from('book-files')
+        .from('audio-files')
         .upload(fileName, audioBuffer, { contentType: 'audio/mpeg', upsert: true });
 
       if (uploadError) {
@@ -251,7 +251,7 @@ serve(async (req) => {
         });
       }
 
-      const { data: urlData } = supabase.storage.from('book-files').getPublicUrl(fileName);
+      const { data: urlData } = supabase.storage.from('audio-files').getPublicUrl(fileName);
 
       return respond({
         success: true,
@@ -457,10 +457,10 @@ serve(async (req) => {
           audioBuffer[j] = binaryString.charCodeAt(j);
         }
 
-        const audioFileName = `audiobooks/${bookId}/page_${String(pageNum).padStart(4, '0')}.mp3`;
+        const audioFileName = `${bookId}/page_${String(pageNum).padStart(4, '0')}.mp3`;
 
         const { error: uploadError } = await supabase.storage
-          .from('book-files')
+          .from('audio-files')
           .upload(audioFileName, audioBuffer, {
             contentType: 'audio/mpeg',
             upsert: true,
@@ -474,7 +474,7 @@ serve(async (req) => {
 
         // الحصول على رابط الملف
         const { data: urlData } = supabase.storage
-          .from('book-files')
+          .from('audio-files')
           .getPublicUrl(audioFileName);
 
         // تحديث سجل الصفحة
