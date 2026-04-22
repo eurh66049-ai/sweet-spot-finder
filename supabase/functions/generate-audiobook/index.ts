@@ -1,114 +1,294 @@
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+import {
+  AVAILABLE_EMOTIONS,
+  cleanTextForSpeech,
+  decodeBase64Audio,
+  DEFAULT_TTS_MODEL,
+  detectLanguage,
+  fetchAvailableVoices,
+  type MistralEmotion,
+  resolveVoiceId,
+  splitTextIntoChunks,
+} from "../_shared/audiobook-helpers.ts";
 
 const corsHeaders = {
   'Access-Control-Allow-Origin': '*',
   'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type, x-supabase-client-platform, x-supabase-client-platform-version, x-supabase-client-runtime, x-supabase-client-runtime-version',
 };
 
-function respond(payload: Record<string, unknown>) {
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+function respond(payload: Record<string, unknown>, status = 200) {
   return new Response(JSON.stringify(payload), {
-    status: 200,
+    status,
     headers: { ...corsHeaders, 'Content-Type': 'application/json' },
   });
 }
 
-// تقسيم النص إلى أجزاء مناسبة (حد Groq ~4096 حرف لكل طلب)
-function splitTextIntoChunks(text: string, maxChars = 3500): string[] {
-  const chunks: string[] = [];
-  const sentences = text.split(/(?<=[.!؟。\n])\s*/);
-  let current = '';
+function appendError(existing: string | null | undefined, next: string) {
+  const values = [existing, next]
+    .filter(Boolean)
+    .flatMap((value) => String(value).split('; '))
+    .map((value) => value.trim())
+    .filter(Boolean);
 
-  for (const sentence of sentences) {
-    if ((current + sentence).length > maxChars && current.length > 0) {
-      chunks.push(current.trim());
-      current = sentence;
-    } else {
-      current += (current ? ' ' : '') + sentence;
+  return Array.from(new Set(values)).slice(-8).join('; ');
+}
+
+async function callMistralTtsWithRetry(
+  apiKey: string,
+  body: Record<string, unknown>,
+  maxRetries = 4,
+): Promise<{ ok: true; audioBase64: string } | { ok: false; error: string; status?: number }> {
+  const delays = [1000, 2500, 5000, 10000];
+
+  for (let attempt = 0; attempt <= maxRetries; attempt += 1) {
+    try {
+      const response = await fetch('https://api.mistral.ai/v1/audio/speech', {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${apiKey}`,
+          'Content-Type': 'application/json',
+          Accept: 'application/json',
+        },
+        body: JSON.stringify(body),
+      });
+
+      if (response.ok) {
+        const json = await response.json();
+        const audioBase64 = json?.audio_data;
+        if (!audioBase64) {
+          return { ok: false, error: 'استجابة Mistral لا تحتوي على audio_data', status: response.status };
+        }
+        return { ok: true, audioBase64 };
+      }
+
+      const errorText = await response.text();
+      const retryable = response.status === 429 || response.status >= 500;
+      if (!retryable || attempt === maxRetries) {
+        return {
+          ok: false,
+          status: response.status,
+          error: `Mistral TTS error ${response.status}: ${errorText.slice(0, 250)}`,
+        };
+      }
+
+      const retryAfter = response.headers.get('retry-after');
+      const waitMs = retryAfter ? Number.parseInt(retryAfter, 10) * 1000 : delays[attempt] || 10000;
+      console.log(`⏳ Retrying TTS after ${waitMs}ms (attempt ${attempt + 1}/${maxRetries})`);
+      await sleep(waitMs);
+    } catch (error) {
+      if (attempt === maxRetries) {
+        return {
+          ok: false,
+          error: error instanceof Error ? error.message : 'Unknown network error',
+        };
+      }
+      await sleep(delays[attempt] || 10000);
     }
   }
-  if (current.trim()) chunks.push(current.trim());
-  return chunks;
+
+  return { ok: false, error: 'Max retries exhausted' };
 }
 
-// كشف لغة النص
-function detectLanguage(text: string): 'ar' | 'en' {
-  const arabicChars = (text.match(/[\u0600-\u06FF]/g) || []).length;
-  const latinChars = (text.match(/[a-zA-Z]/g) || []).length;
-  return arabicChars > latinChars ? 'ar' : 'en';
-}
+async function getBookText(supabase: any, bookId: string) {
+  const { data, error } = await supabase
+    .from('book_extracted_text')
+    .select('extracted_text, text_length')
+    .eq('book_id', bookId)
+    .single();
 
-const DEFAULT_TTS_MODEL = 'voxtral-mini-tts-2603';
-
-type VoiceOption = {
-  id: string;
-  name?: string | null;
-  slug?: string | null;
-  languages?: string[] | null;
-  user_id?: string | null;
-};
-
-// المشاعر المتاحة
-const AVAILABLE_EMOTIONS = ['neutral', 'sad', 'excited', 'curious', 'confident', 'cheerful', 'angry'] as const;
-type MistralEmotion = typeof AVAILABLE_EMOTIONS[number];
-
-function cleanTextForSpeech(text: string): string {
-  return text
-    .replace(/---\s*صفحة\s*\d+\s*---/g, ' ')
-    .replace(/[#*_`>|\[\]()]/g, ' ')
-    .replace(/\s+/g, ' ')
-    .trim();
-}
-
-function voiceMatches(voice: VoiceOption, requestedVoice?: string): boolean {
-  if (!requestedVoice) return false;
-  const normalized = requestedVoice.trim().toLowerCase();
-  return [voice.id, voice.name, voice.slug]
-    .filter(Boolean)
-    .some((value) => String(value).trim().toLowerCase() === normalized);
-}
-
-async function fetchAvailableVoices(apiKey: string): Promise<VoiceOption[]> {
-  const response = await fetch('https://api.mistral.ai/v1/audio/voices?limit=100', {
-    method: 'GET',
-    headers: {
-      'Authorization': `Bearer ${apiKey}`,
-    },
-  });
-
-  if (!response.ok) {
-    const errorText = await response.text();
-    throw new Error(`تعذر جلب الأصوات من Mistral (${response.status}): ${errorText.slice(0, 200)}`);
+  if (error || !data?.extracted_text?.trim()) {
+    throw new Error('لا يوجد نص مستخرج لهذا الكتاب. قم باستخراج النص أولاً باستخدام OCR.');
   }
 
-  const data = await response.json();
-  return Array.isArray(data?.items)
-    ? data.items.filter((item: VoiceOption | undefined) => item?.id)
-    : [];
+  return data;
 }
 
-function resolveVoiceId(availableVoices: VoiceOption[], language: 'ar' | 'en', requestedVoice?: string): string | null {
-  const directMatch = availableVoices.find((voice) => voiceMatches(voice, requestedVoice));
-  if (directMatch) return directMatch.id;
+async function getBookTitle(supabase: any, bookId: string) {
+  const { data } = await supabase
+    .from('approved_books')
+    .select('title')
+    .eq('id', bookId)
+    .single();
 
-  const envKey = language === 'ar' ? 'MISTRAL_TTS_VOICE_AR' : 'MISTRAL_TTS_VOICE_EN';
-  const envVoice = Deno.env.get(envKey);
-  const envMatch = availableVoices.find((voice) => voiceMatches(voice, envVoice));
-  if (envMatch) return envMatch.id;
+  return data?.title || 'كتاب';
+}
 
-  const languageHints = language === 'ar'
-    ? ['ar', 'arabic', 'عرب']
-    : ['en', 'english'];
+async function getLatestJob(supabase: any, bookId: string) {
+  const { data, error } = await supabase
+    .from('audiobook_jobs')
+    .select('*')
+    .eq('book_id', bookId)
+    .order('created_at', { ascending: false })
+    .limit(1)
+    .maybeSingle();
 
-  const hintedVoice = availableVoices.find((voice) => {
-    const searchable = [voice.name, voice.slug, ...(voice.languages || [])]
-      .filter(Boolean)
-      .map((value) => String(value).toLowerCase());
+  if (error) {
+    throw new Error(`تعذر جلب حالة التحويل: ${error.message}`);
+  }
 
-    return searchable.some((value) => languageHints.some((hint) => value.includes(hint)));
+  return data;
+}
+
+async function finalizeJob(
+  supabase: any,
+  jobId: string,
+  bookId: string,
+  processedPages: number,
+  totalPages: number,
+  errorMessage?: string | null,
+) {
+  const { count } = await supabase
+    .from('audiobook_text')
+    .select('*', { count: 'exact', head: true })
+    .eq('tts_status', 'completed')
+    .eq('book_id', bookId);
+
+  const hasSuccess = Boolean((count || 0) > 0);
+  const finalStatus = hasSuccess
+    ? (errorMessage ? 'completed_with_errors' : 'completed')
+    : 'failed';
+
+  await supabase
+    .from('audiobook_jobs')
+    .update({
+      status: finalStatus,
+      current_step: 'done',
+      processed_pages: processedPages,
+      total_pages: totalPages,
+      error_message: errorMessage || null,
+      completed_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+    })
+    .eq('id', jobId);
+
+  return finalStatus;
+}
+
+async function processSingleChunk(params: {
+  supabase: any;
+  apiKey: string;
+  bookId: string;
+  jobId: string;
+  pageNum: number;
+  totalPages: number;
+  chunk: string;
+  voiceId: string;
+  selectedEmotion?: MistralEmotion;
+}) {
+  const { supabase, apiKey, bookId, jobId, pageNum, totalPages, chunk, voiceId, selectedEmotion } = params;
+
+  const preparedChunk = cleanTextForSpeech(chunk);
+  await supabase
+    .from('audiobook_jobs')
+    .update({
+      status: 'processing',
+      current_step: `converting_page_${pageNum}_of_${totalPages}`,
+      updated_at: new Date().toISOString(),
+    })
+    .eq('id', jobId);
+
+  await supabase
+    .from('audiobook_text')
+    .upsert({
+      book_id: bookId,
+      page_number: pageNum,
+      cleaned_text: chunk,
+      cleanup_status: 'completed',
+      tts_status: 'processing',
+      error_message: null,
+      updated_at: new Date().toISOString(),
+    }, { onConflict: 'book_id,page_number' });
+
+  if (!preparedChunk) {
+    const errorMessage = 'النص المستخرج فارغ بعد التنظيف';
+    await supabase
+      .from('audiobook_text')
+      .update({
+        tts_status: 'failed',
+        error_message: errorMessage,
+        updated_at: new Date().toISOString(),
+      })
+      .eq('book_id', bookId)
+      .eq('page_number', pageNum);
+
+    return { ok: false as const, errorMessage };
+  }
+
+  const styledInput = selectedEmotion
+    ? `اقرأ النص التالي بنبرة ${selectedEmotion}: ${preparedChunk}`
+    : preparedChunk;
+
+  const ttsResult = await callMistralTtsWithRetry(apiKey, {
+    model: DEFAULT_TTS_MODEL,
+    input: styledInput,
+    voice_id: voiceId,
+    response_format: 'mp3',
   });
 
-  return hintedVoice?.id || availableVoices[0]?.id || null;
+  if (!ttsResult.ok) {
+    const errorMessage = ttsResult.status === 404
+      ? `الصوت المحدد غير موجود في Mistral أو غير متاح لهذا الحساب (voice_id: ${voiceId})`
+      : ttsResult.status === 410
+        ? 'إعدادات TTS هذه متوقفة أو قديمة في Mistral'
+        : ttsResult.status === 400
+          ? 'طلب TTS غير صالح - تم رفضه من Mistral'
+          : ttsResult.error;
+
+    await supabase
+      .from('audiobook_text')
+      .update({
+        tts_status: 'failed',
+        error_message: errorMessage,
+        updated_at: new Date().toISOString(),
+      })
+      .eq('book_id', bookId)
+      .eq('page_number', pageNum);
+
+    return { ok: false as const, errorMessage };
+  }
+
+  const audioBuffer = decodeBase64Audio(ttsResult.audioBase64);
+  const audioFileName = `${bookId}/page_${String(pageNum).padStart(4, '0')}.mp3`;
+
+  const { error: uploadError } = await supabase.storage
+    .from('audio-files')
+    .upload(audioFileName, audioBuffer, {
+      contentType: 'audio/mpeg',
+      upsert: true,
+    });
+
+  if (uploadError) {
+    await supabase
+      .from('audiobook_text')
+      .update({
+        tts_status: 'failed',
+        error_message: uploadError.message,
+        updated_at: new Date().toISOString(),
+      })
+      .eq('book_id', bookId)
+      .eq('page_number', pageNum);
+
+    return { ok: false as const, errorMessage: uploadError.message };
+  }
+
+  const { data: urlData } = supabase.storage
+    .from('audio-files')
+    .getPublicUrl(audioFileName);
+
+  await supabase
+    .from('audiobook_text')
+    .update({
+      audio_file_url: urlData.publicUrl,
+      tts_status: 'completed',
+      updated_at: new Date().toISOString(),
+    })
+    .eq('book_id', bookId)
+    .eq('page_number', pageNum);
+
+  return { ok: true as const, audioUrl: urlData.publicUrl };
 }
 
 serve(async (req) => {
@@ -128,29 +308,27 @@ serve(async (req) => {
 
     const { bookId, action = 'start', voice, emotion, text } = await req.json();
 
-    // إرجاع قائمة الأصوات المتاحة
     if (action === 'voices') {
       const voices = await fetchAvailableVoices(MISTRAL_API_KEY);
       return respond({
         success: true,
         voices,
-        emotions: AVAILABLE_EMOTIONS.map(e => ({ id: e, name: e.charAt(0).toUpperCase() + e.slice(1) })),
+        emotions: AVAILABLE_EMOTIONS.map((item) => ({ id: item, name: item.charAt(0).toUpperCase() + item.slice(1) })),
       });
     }
 
-    // === اختبار سريع: تحويل جملة واحدة وإرجاع الصوت ===
     if (action === 'test') {
       const sampleText = (typeof text === 'string' && text.trim()) ? text.trim() : 'مرحباً، هذا اختبار لتحويل النص إلى صوت.';
       const language = detectLanguage(sampleText);
       const cleaned = cleanTextForSpeech(sampleText) || sampleText;
-
       const availableVoices = await fetchAvailableVoices(MISTRAL_API_KEY);
+
       if (availableVoices.length === 0) {
         return respond({
           success: false,
           ok: false,
           stage: 'voices',
-          error: 'لا توجد أصوات TTS متاحة في حساب Mistral. أنشئ صوتاً (Voice cloning) أولاً من لوحة Mistral.',
+          error: 'لا توجد أصوات TTS متاحة في حساب Mistral. أنشئ صوتاً أولاً من لوحة Mistral.',
         });
       }
 
@@ -161,98 +339,50 @@ serve(async (req) => {
           ok: false,
           stage: 'voice_resolve',
           error: 'تعذر اختيار voice_id صالح.',
-          availableVoiceIds: availableVoices.map(v => v.id),
+          availableVoiceIds: availableVoices.map((item) => item.id),
         });
       }
 
       const selectedEmotion = emotion && AVAILABLE_EMOTIONS.includes(emotion) ? emotion : undefined;
       const styledInput = selectedEmotion ? `اقرأ النص التالي بنبرة ${selectedEmotion}: ${cleaned}` : cleaned;
-
-      const ttsBody: Record<string, unknown> = {
+      const ttsResult = await callMistralTtsWithRetry(MISTRAL_API_KEY, {
         model: DEFAULT_TTS_MODEL,
         input: styledInput,
         voice_id: voiceId,
         response_format: 'mp3',
-      };
-
-      console.log(`🧪 TEST TTS — voice=${voiceId}, lang=${language}, len=${cleaned.length}`);
-
-      const ttsResponse = await fetch('https://api.mistral.ai/v1/audio/speech', {
-        method: 'POST',
-        headers: {
-          'Authorization': `Bearer ${MISTRAL_API_KEY}`,
-          'Content-Type': 'application/json',
-          'Accept': 'application/json',
-        },
-        body: JSON.stringify(ttsBody),
       });
 
-      const rawBody = await ttsResponse.text();
-
-      if (!ttsResponse.ok) {
-        console.error('TEST TTS failed:', ttsResponse.status, rawBody);
+      if (!ttsResult.ok) {
         return respond({
           success: false,
           ok: false,
           stage: 'tts',
-          status: ttsResponse.status,
+          status: ttsResult.status,
           voiceId,
           model: DEFAULT_TTS_MODEL,
-          mistralError: rawBody.slice(0, 1000),
-          error: `Mistral رفض الطلب (${ttsResponse.status})`,
+          error: ttsResult.error,
         });
       }
 
-      let audioBase64: string | undefined;
-      try {
-        const json = JSON.parse(rawBody);
-        audioBase64 = json?.audio_data;
-      } catch (_e) {
-        return respond({
-          success: false,
-          ok: false,
-          stage: 'parse',
-          error: 'استجابة Mistral ليست JSON صالحاً',
-          preview: rawBody.slice(0, 300),
-        });
-      }
-
-      if (!audioBase64) {
-        return respond({
-          success: false,
-          ok: false,
-          stage: 'audio_data',
-          error: 'لم يتم إرجاع audio_data من Mistral',
-        });
-      }
-
-      // رفع الملف للتجربة
-      const binaryString = atob(audioBase64);
-      const audioBuffer = new Uint8Array(binaryString.length);
-      for (let j = 0; j < binaryString.length; j++) {
-        audioBuffer[j] = binaryString.charCodeAt(j);
-      }
-
+      const audioBuffer = decodeBase64Audio(ttsResult.audioBase64);
       const fileName = `_tests/test_${Date.now()}.mp3`;
       const { error: uploadError } = await supabase.storage
         .from('audio-files')
         .upload(fileName, audioBuffer, { contentType: 'audio/mpeg', upsert: true });
 
       if (uploadError) {
-        // حتى لو فشل الرفع، نرجع الصوت كـ data URL مباشرة
         return respond({
           success: true,
           ok: true,
           stage: 'data_url',
           voiceId,
           language,
-          audioDataUrl: `data:audio/mpeg;base64,${audioBase64}`,
+          audioDataUrl: `data:audio/mpeg;base64,${ttsResult.audioBase64}`,
           uploadError: uploadError.message,
         });
       }
 
       const { data: urlData } = supabase.storage.from('audio-files').getPublicUrl(fileName);
-
       return respond({
         success: true,
         ok: true,
@@ -260,80 +390,34 @@ serve(async (req) => {
         voiceId,
         language,
         audioUrl: urlData.publicUrl,
-        audioDataUrl: `data:audio/mpeg;base64,${audioBase64}`,
+        audioDataUrl: `data:audio/mpeg;base64,${ttsResult.audioBase64}`,
       });
     }
 
-    if (!bookId) throw new Error('bookId is required');
+    if (!bookId) {
+      throw new Error('bookId is required');
+    }
 
-    // === الحصول على حالة المهمة ===
     if (action === 'status') {
-      const { data: job } = await supabase
-        .from('audiobook_jobs')
-        .select('*')
-        .eq('book_id', bookId)
-        .order('created_at', { ascending: false })
-        .limit(1)
-        .single();
-
+      const job = await getLatestJob(supabase, bookId);
       return respond({ success: true, ok: true, job });
     }
 
-    // === بدء عملية التحويل (async background job) ===
-
-    // 1. جلب النص المستخرج من الكتاب
-    const { data: textData, error: textError } = await supabase
-      .from('book_extracted_text')
-      .select('extracted_text, text_length')
-      .eq('book_id', bookId)
-      .single();
-
-    if (textError || !textData?.extracted_text) {
-      throw new Error('لا يوجد نص مستخرج لهذا الكتاب. قم باستخراج النص أولاً باستخدام OCR.');
-    }
-
-    // 2. جلب معلومات الكتاب
-    const { data: book } = await supabase
-      .from('book_submissions')
-      .select('title')
-      .eq('id', bookId)
-      .eq('status', 'approved')
-      .single();
-
-    const bookTitle = book?.title || 'كتاب';
-
-    // 3. تقسيم النص إلى أجزاء
-    const fullText = textData.extracted_text;
+    const textData = await getBookText(supabase, bookId);
+    const fullText = textData.extracted_text.trim();
     const chunks = splitTextIntoChunks(fullText);
-    const language = detectLanguage(fullText);
     const totalPages = chunks.length;
 
-    console.log(`📖 Starting audiobook generation for "${bookTitle}" - ${totalPages} chunks, language: ${language}`);
+    if (totalPages === 0) {
+      throw new Error('النص المستخرج فارغ ولا يمكن تحويله إلى صوت.');
+    }
 
-    // 4. إنشاء/تحديث سجل المهمة
-    const { data: job, error: jobError } = await supabase
-      .from('audiobook_jobs')
-      .upsert({
-        book_id: bookId,
-        book_title: bookTitle,
-        status: 'processing',
-        current_step: 'initializing',
-        total_pages: totalPages,
-        processed_pages: 0,
-        error_message: null,
-        completed_at: null,
-        started_at: new Date().toISOString(),
-        updated_at: new Date().toISOString(),
-      }, { onConflict: 'book_id' })
-      .select()
-      .single();
-
-    if (jobError) throw new Error(`Failed to create job: ${jobError.message}`);
-
-    // 5. اختيار صوت صالح من Mistral فعلياً
+    const language = detectLanguage(fullText);
+    const bookTitle = await getBookTitle(supabase, bookId);
     const availableVoices = await fetchAvailableVoices(MISTRAL_API_KEY);
+
     if (availableVoices.length === 0) {
-      throw new Error('لا توجد أصوات TTS متاحة في Mistral لهذا الحساب حالياً. أضف صوتاً أو فعّل صوتاً محفوظاً أولاً.');
+      throw new Error('لا توجد أصوات TTS متاحة في Mistral لهذا الحساب حالياً.');
     }
 
     const voiceId = resolveVoiceId(availableVoices, language, voice);
@@ -343,38 +427,130 @@ serve(async (req) => {
 
     const selectedEmotion = emotion && AVAILABLE_EMOTIONS.includes(emotion) ? emotion : undefined;
 
-    console.log(`🎙️ Using voice: ${voiceId}, emotion: ${selectedEmotion || 'default'}, available voices: ${availableVoices.length}`);
+    if (action === 'start') {
+      await supabase.from('audiobook_text').delete().eq('book_id', bookId);
 
-    // ✅ التشغيل في الخلفية: نرد فوراً 202 ونكمل المعالجة بدون انتظار
-    const backgroundTask = processAudiobookInBackground({
+      const { data: job, error: jobError } = await supabase
+        .from('audiobook_jobs')
+        .upsert({
+          book_id: bookId,
+          book_title: bookTitle,
+          status: 'processing',
+          current_step: `queued_0_of_${totalPages}`,
+          total_pages: totalPages,
+          processed_pages: 0,
+          error_message: null,
+          completed_at: null,
+          started_at: new Date().toISOString(),
+          updated_at: new Date().toISOString(),
+        }, { onConflict: 'book_id' })
+        .select()
+        .single();
+
+      if (jobError) {
+        throw new Error(`Failed to create job: ${jobError.message}`);
+      }
+
+      return respond({
+        success: true,
+        ok: true,
+        jobId: job.id,
+        status: 'processing',
+        totalPages,
+        language,
+        voiceId,
+        currentStep: `queued_0_of_${totalPages}`,
+        message: 'تم تجهيز التحويل الصوتي وسيبدأ على دفعات قصيرة لتفادي التوقف.',
+      });
+    }
+
+    if (action !== 'process-next') {
+      throw new Error('Unsupported action');
+    }
+
+    const job = await getLatestJob(supabase, bookId);
+    if (!job) {
+      throw new Error('لا توجد مهمة تحويل لهذا الكتاب. ابدأ التحويل أولاً.');
+    }
+
+    if (job.status === 'completed' || job.status === 'completed_with_errors' || job.status === 'failed') {
+      return respond({
+        success: true,
+        ok: true,
+        status: job.status,
+        processedPages: job.processed_pages || 0,
+        totalPages: job.total_pages || totalPages,
+        currentStep: job.current_step,
+        error: job.error_message,
+      });
+    }
+
+    const processedPages = Number(job.processed_pages || 0);
+    const nextIndex = processedPages;
+
+    if (nextIndex >= totalPages) {
+      const finalStatus = await finalizeJob(supabase, job.id, bookId, processedPages, totalPages, job.error_message);
+      return respond({
+        success: true,
+        ok: true,
+        status: finalStatus,
+        processedPages,
+        totalPages,
+        currentStep: 'done',
+        error: job.error_message,
+      });
+    }
+
+    const pageNum = nextIndex + 1;
+    console.log(`🔊 Processing chunk ${pageNum}/${totalPages} (${chunks[nextIndex].length} chars)...`);
+
+    const chunkResult = await processSingleChunk({
       supabase,
-      MISTRAL_API_KEY,
+      apiKey: MISTRAL_API_KEY,
       bookId,
       jobId: job.id,
-      chunks,
+      pageNum,
       totalPages,
+      chunk: chunks[nextIndex],
       voiceId,
       selectedEmotion,
     });
 
-    // @ts-ignore - EdgeRuntime متاح في Supabase Edge Runtime
-    if (typeof EdgeRuntime !== 'undefined' && EdgeRuntime.waitUntil) {
-      // @ts-ignore
-      EdgeRuntime.waitUntil(backgroundTask);
+    const nextProcessedPages = pageNum;
+    const nextErrorMessage = chunkResult.ok
+      ? (job.error_message || null)
+      : appendError(job.error_message, `Chunk ${pageNum}: ${chunkResult.errorMessage}`);
+
+    const isLastChunk = nextProcessedPages >= totalPages;
+    const nextStep = isLastChunk ? 'done' : `queued_${nextProcessedPages}_of_${totalPages}`;
+
+    let nextStatus = 'processing';
+    if (isLastChunk) {
+      nextStatus = await finalizeJob(supabase, job.id, bookId, nextProcessedPages, totalPages, nextErrorMessage);
     } else {
-      // fallback: لا تنتظر النتيجة، فقط أطلق المهمة
-      backgroundTask.catch(err => console.error('Background task failed:', err));
+      await supabase
+        .from('audiobook_jobs')
+        .update({
+          status: 'processing',
+          current_step: nextStep,
+          processed_pages: nextProcessedPages,
+          total_pages: totalPages,
+          error_message: nextErrorMessage,
+          updated_at: new Date().toISOString(),
+        })
+        .eq('id', job.id);
     }
 
     return respond({
       success: true,
       ok: true,
-      jobId: job.id,
-      status: 'processing',
+      status: nextStatus,
+      processedPages: nextProcessedPages,
       totalPages,
-      language,
+      currentStep: isLastChunk ? 'done' : nextStep,
+      error: nextErrorMessage,
+      pageProcessed: pageNum,
       voiceId,
-      message: 'بدأ التحويل في الخلفية. تابع التقدم من حالة المهمة.',
     });
   } catch (error) {
     console.error('Generate audiobook error:', error);
@@ -382,217 +558,6 @@ serve(async (req) => {
       ok: false,
       success: false,
       error: error instanceof Error ? error.message : 'Unknown error',
-    });
+    }, 500);
   }
 });
-
-// ============================================================
-// Background processing function
-// ============================================================
-interface BackgroundTaskParams {
-  supabase: any;
-  MISTRAL_API_KEY: string;
-  bookId: string;
-  jobId: string;
-  chunks: string[];
-  totalPages: number;
-  voiceId: string;
-  selectedEmotion?: MistralEmotion;
-}
-
-async function processAudiobookInBackground(params: BackgroundTaskParams) {
-  const { supabase, MISTRAL_API_KEY, bookId, jobId, chunks, totalPages, voiceId, selectedEmotion } = params;
-  let processedCount = 0;
-  const errors: string[] = [];
-
-  try {
-
-    for (let i = 0; i < chunks.length; i++) {
-      const chunk = chunks[i];
-      const pageNum = i + 1;
-
-      try {
-        console.log(`🔊 Processing chunk ${pageNum}/${totalPages} (${chunk.length} chars)...`);
-
-        // حفظ النص المنظف
-        await supabase
-          .from('audiobook_text')
-          .upsert({
-            book_id: bookId,
-            page_number: pageNum,
-            cleaned_text: chunk,
-            cleanup_status: 'completed',
-            tts_status: 'processing',
-            updated_at: new Date().toISOString(),
-          }, { onConflict: 'book_id,page_number' });
-
-        // استدعاء Mistral TTS API
-        // المرجع: https://docs.mistral.ai/api/endpoint/audio/speech
-        const preparedChunk = cleanTextForSpeech(chunk);
-        if (!preparedChunk) {
-          errors.push(`Chunk ${pageNum}: نص فارغ بعد التنظيف`);
-          await supabase
-            .from('audiobook_text')
-            .update({
-              tts_status: 'failed',
-              error_message: 'النص المستخرج فارغ بعد التنظيف',
-              updated_at: new Date().toISOString(),
-            })
-            .eq('book_id', bookId)
-            .eq('page_number', pageNum);
-          continue;
-        }
-
-        const styledInput = selectedEmotion
-          ? `اقرأ النص التالي بنبرة ${selectedEmotion}: ${preparedChunk}`
-          : preparedChunk;
-
-        const ttsBody: Record<string, unknown> = {
-          model: DEFAULT_TTS_MODEL,
-          input: styledInput,
-          voice_id: voiceId,
-          response_format: 'mp3',
-        };
-
-        const ttsResponse = await fetch('https://api.mistral.ai/v1/audio/speech', {
-          method: 'POST',
-          headers: {
-            'Authorization': `Bearer ${MISTRAL_API_KEY}`,
-            'Content-Type': 'application/json',
-            'Accept': 'application/json',
-          },
-          body: JSON.stringify(ttsBody),
-        });
-
-        if (!ttsResponse.ok) {
-          const errText = await ttsResponse.text();
-          console.error(`Mistral TTS error for chunk ${pageNum}:`, ttsResponse.status, errText);
-          const friendlyError = ttsResponse.status === 404
-            ? `الصوت المحدد غير موجود في Mistral أو غير متاح لهذا الحساب (voice_id: ${voiceId})`
-            : ttsResponse.status === 410
-              ? 'إعدادات TTS هذه متوقفة أو قديمة في Mistral'
-              : ttsResponse.status === 400
-                ? 'طلب TTS غير صالح - تم رفضه من Mistral'
-                : `TTS error: ${ttsResponse.status}`;
-          errors.push(`Chunk ${pageNum}: ${ttsResponse.status} (${voiceId})`);
-
-          await supabase
-            .from('audiobook_text')
-            .update({
-              tts_status: 'failed',
-              error_message: friendlyError,
-              updated_at: new Date().toISOString(),
-            })
-            .eq('book_id', bookId)
-            .eq('page_number', pageNum);
-
-          continue;
-        }
-
-        // استجابة Mistral TTS هي JSON تحتوي على audio_data بتشفير base64
-        const ttsJson = await ttsResponse.json();
-        const audioBase64: string | undefined = ttsJson?.audio_data;
-
-        if (!audioBase64) {
-          console.error(`Mistral TTS: missing audio_data for chunk ${pageNum}`, ttsJson);
-          errors.push(`Chunk ${pageNum}: استجابة بدون بيانات صوتية`);
-          await supabase
-            .from('audiobook_text')
-            .update({
-              tts_status: 'failed',
-              error_message: 'استجابة بدون audio_data',
-              updated_at: new Date().toISOString(),
-            })
-            .eq('book_id', bookId)
-            .eq('page_number', pageNum);
-          continue;
-        }
-
-        // فك تشفير base64 إلى Uint8Array (آمن للملفات الكبيرة)
-        const binaryString = atob(audioBase64);
-        const audioBuffer = new Uint8Array(binaryString.length);
-        for (let j = 0; j < binaryString.length; j++) {
-          audioBuffer[j] = binaryString.charCodeAt(j);
-        }
-
-        const audioFileName = `${bookId}/page_${String(pageNum).padStart(4, '0')}.mp3`;
-
-        const { error: uploadError } = await supabase.storage
-          .from('audio-files')
-          .upload(audioFileName, audioBuffer, {
-            contentType: 'audio/mpeg',
-            upsert: true,
-          });
-
-        if (uploadError) {
-          console.error(`Storage upload error for chunk ${pageNum}:`, uploadError);
-          errors.push(`Upload chunk ${pageNum}: ${uploadError.message}`);
-          continue;
-        }
-
-        // الحصول على رابط الملف
-        const { data: urlData } = supabase.storage
-          .from('audio-files')
-          .getPublicUrl(audioFileName);
-
-        // تحديث سجل الصفحة
-        await supabase
-          .from('audiobook_text')
-          .update({
-            audio_file_url: urlData.publicUrl,
-            tts_status: 'completed',
-            updated_at: new Date().toISOString(),
-          })
-          .eq('book_id', bookId)
-          .eq('page_number', pageNum);
-
-        processedCount++;
-
-        // تحديث تقدم المهمة
-        await supabase
-          .from('audiobook_jobs')
-          .update({
-            processed_pages: processedCount,
-            current_step: `converting_page_${pageNum}_of_${totalPages}`,
-            updated_at: new Date().toISOString(),
-          })
-          .eq('id', jobId);
-
-      } catch (chunkError) {
-        console.error(`Error processing chunk ${pageNum}:`, chunkError);
-        errors.push(`Chunk ${pageNum}: ${chunkError instanceof Error ? chunkError.message : 'Unknown'}`);
-      }
-    }
-
-    // 7. تحديث حالة المهمة النهائية
-    const finalStatus = processedCount > 0 ? (errors.length > 0 ? 'completed_with_errors' : 'completed') : 'failed';
-
-    await supabase
-      .from('audiobook_jobs')
-      .update({
-        status: finalStatus,
-        current_step: 'done',
-        processed_pages: processedCount,
-        completed_at: new Date().toISOString(),
-        error_message: errors.length > 0 ? errors.join('; ') : null,
-        updated_at: new Date().toISOString(),
-      })
-      .eq('id', jobId);
-
-    console.log(`✅ Audiobook generation ${finalStatus}: ${processedCount}/${totalPages} chunks processed`);
-  } catch (bgError) {
-    console.error('❌ Background audiobook task failed:', bgError);
-    await supabase
-      .from('audiobook_jobs')
-      .update({
-        status: 'failed',
-        current_step: 'error',
-        processed_pages: processedCount,
-        error_message: bgError instanceof Error ? bgError.message : 'Unknown background error',
-        completed_at: new Date().toISOString(),
-        updated_at: new Date().toISOString(),
-      })
-      .eq('id', jobId);
-  }
-}
-

@@ -200,10 +200,11 @@ serve(async (req) => {
 
     return new Response(
       JSON.stringify({
-        success: true,
+        success: finalStatus === 'completed',
         bookId,
         processedPages,
         textLength: allText.trim().length,
+        hasText: Boolean(allText.trim()),
         status: finalStatus,
         errors: errors.length > 0 ? errors : undefined,
       }),
