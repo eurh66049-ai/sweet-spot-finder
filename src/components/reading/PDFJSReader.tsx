@@ -6,6 +6,9 @@ import {
   Home,
   Maximize,
   Sparkles,
+  ScanText,
+  Volume2,
+  Square,
 } from 'lucide-react';
 import ReadingModeSelector, { ReadingMode, getReadingModeConfig } from './ReadingModeSelector';
 import { toast } from 'sonner';
@@ -60,7 +63,9 @@ const PDFJSReader = () => {
   const [savedPage, setSavedPage] = useState<number | null>(null);
   const [readingMode, setReadingMode] = useState<ReadingMode>('normal');
   const [aiSearchOpen, setAiSearchOpen] = useState(false);
-  const [pdfTextContent] = useState('');
+  const [pdfTextContent, setPdfTextContent] = useState('');
+  const [ocrLoading, setOcrLoading] = useState(false);
+  const [readingAloud, setReadingAloud] = useState(false);
   const [scale] = useState(() => {
     const devicePixelRatio = window.devicePixelRatio || 1;
     const screenWidth = window.screen.width;
@@ -399,6 +404,63 @@ const PDFJSReader = () => {
 
     void document.exitFullscreen();
   };
+
+  const handleExtractBookText = useCallback(async () => {
+    if (!book?.id || ocrLoading) return;
+    setOcrLoading(true);
+    try {
+      const { data, error } = await supabase.functions.invoke('extract-book-text', {
+        body: { bookId: book.id, bookTable: 'approved_books' },
+      });
+
+      if (error) throw error;
+      if (!data?.success || !data?.hasText) {
+        throw new Error(data?.error || 'لم يتم العثور على نص داخل الكتاب');
+      }
+
+      const { data: extracted } = await supabase
+        .from('book_extracted_text')
+        .select('extracted_text')
+        .eq('book_id', book.id)
+        .single();
+
+      if (extracted?.extracted_text) {
+        setPdfTextContent(extracted.extracted_text);
+      }
+      toast.success(`تم استخراج النص (${data.textLength?.toLocaleString?.() || 0} حرف)`);
+    } catch (extractError) {
+      toast.error(extractError instanceof Error ? extractError.message : 'فشل استخراج النص');
+    } finally {
+      setOcrLoading(false);
+    }
+  }, [book?.id, ocrLoading]);
+
+  const handleReadAloud = useCallback(async () => {
+    if (readingAloud) {
+      window.speechSynthesis.cancel();
+      setReadingAloud(false);
+      return;
+    }
+
+    let textToRead = pdfTextContent.trim();
+    if (!textToRead) {
+      textToRead = (await getPagesText([currentVisiblePage, currentVisiblePage + 1])).trim();
+    }
+
+    if (!textToRead) {
+      toast.error('لا يوجد نص جاهز للقراءة حالياً، جرّب OCR أولاً');
+      return;
+    }
+
+    const utterance = new SpeechSynthesisUtterance(textToRead.slice(0, 5000));
+    utterance.lang = /[\u0600-\u06FF]/.test(textToRead) ? 'ar-SA' : 'en-US';
+    utterance.rate = 0.95;
+    utterance.onend = () => setReadingAloud(false);
+    utterance.onerror = () => setReadingAloud(false);
+    window.speechSynthesis.cancel();
+    window.speechSynthesis.speak(utterance);
+    setReadingAloud(true);
+  }, [currentVisiblePage, getPagesText, pdfTextContent, readingAloud]);
 
   const modeConfig = useMemo(() => getReadingModeConfig(readingMode), [readingMode]);
 
@@ -762,6 +824,25 @@ const PDFJSReader = () => {
             >
               <Sparkles className="h-4 w-4" />
             </Button>
+             <Button
+               variant="ghost"
+               size="sm"
+               onClick={handleExtractBookText}
+               className="h-8 w-8 p-0 rounded-full hover:bg-accent"
+               title="استخراج النص"
+               disabled={ocrLoading}
+             >
+               <ScanText className={`h-4 w-4 ${ocrLoading ? 'animate-pulse' : ''}`} />
+             </Button>
+             <Button
+               variant="ghost"
+               size="sm"
+               onClick={handleReadAloud}
+               className="h-8 w-8 p-0 rounded-full hover:bg-accent"
+               title={readingAloud ? 'إيقاف القراءة' : 'قراءة الكتاب'}
+             >
+               {readingAloud ? <Square className="h-4 w-4" /> : <Volume2 className="h-4 w-4" />}
+             </Button>
             <ReadingModeSelector selectedMode={readingMode} onModeChange={setReadingMode} />
             <Button
               variant="ghost"

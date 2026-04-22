@@ -92,7 +92,7 @@ async function callMistralTtsWithRetry(
   return { ok: false, error: 'Max retries exhausted' };
 }
 
-async function getBookText(supabase: ReturnType<typeof createClient>, bookId: string) {
+async function getBookText(supabase: any, bookId: string) {
   const { data, error } = await supabase
     .from('book_extracted_text')
     .select('extracted_text, text_length')
@@ -106,7 +106,7 @@ async function getBookText(supabase: ReturnType<typeof createClient>, bookId: st
   return data;
 }
 
-async function getBookTitle(supabase: ReturnType<typeof createClient>, bookId: string) {
+async function getBookTitle(supabase: any, bookId: string) {
   const { data } = await supabase
     .from('approved_books')
     .select('title')
@@ -116,7 +116,7 @@ async function getBookTitle(supabase: ReturnType<typeof createClient>, bookId: s
   return data?.title || 'كتاب';
 }
 
-async function getLatestJob(supabase: ReturnType<typeof createClient>, bookId: string) {
+async function getLatestJob(supabase: any, bookId: string) {
   const { data, error } = await supabase
     .from('audiobook_jobs')
     .select('*')
@@ -133,7 +133,7 @@ async function getLatestJob(supabase: ReturnType<typeof createClient>, bookId: s
 }
 
 async function finalizeJob(
-  supabase: ReturnType<typeof createClient>,
+  supabase: any,
   jobId: string,
   bookId: string,
   processedPages: number,
@@ -168,7 +168,7 @@ async function finalizeJob(
 }
 
 async function processSingleChunk(params: {
-  supabase: ReturnType<typeof createClient>;
+  supabase: any;
   apiKey: string;
   bookId: string;
   jobId: string;
