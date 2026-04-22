@@ -15,6 +15,3 @@ export const supabase = createClient<Database>(SUPABASE_URL, SUPABASE_PUBLISHABL
     autoRefreshToken: true,
   }
 });
-
-// Separate alias used by existing Edge Function calls throughout the app.
-export const supabaseFunctions = supabase;
