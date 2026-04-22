@@ -279,7 +279,7 @@ serve(async (req) => {
       return respond({ success: true, ok: true, job });
     }
 
-    // === بدء عملية التحويل ===
+    // === بدء عملية التحويل (async background job) ===
 
     // 1. جلب النص المستخرج من الكتاب
     const { data: textData, error: textError } = await supabase
@@ -310,14 +310,14 @@ serve(async (req) => {
 
     console.log(`📖 Starting audiobook generation for "${bookTitle}" - ${totalPages} chunks, language: ${language}`);
 
-    // 4. إنشاء/تحديث سجل المهمة (upsert لتجنب خطأ duplicate key عند إعادة المحاولة)
+    // 4. إنشاء/تحديث سجل المهمة
     const { data: job, error: jobError } = await supabase
       .from('audiobook_jobs')
       .upsert({
         book_id: bookId,
         book_title: bookTitle,
         status: 'processing',
-        current_step: 'converting_text_to_speech',
+        current_step: 'initializing',
         total_pages: totalPages,
         processed_pages: 0,
         error_message: null,
@@ -345,9 +345,67 @@ serve(async (req) => {
 
     console.log(`🎙️ Using voice: ${voiceId}, emotion: ${selectedEmotion || 'default'}, available voices: ${availableVoices.length}`);
 
-    // 6. معالجة كل جزء
-    let processedCount = 0;
-    const errors: string[] = [];
+    // ✅ التشغيل في الخلفية: نرد فوراً 202 ونكمل المعالجة بدون انتظار
+    const backgroundTask = processAudiobookInBackground({
+      supabase,
+      MISTRAL_API_KEY,
+      bookId,
+      jobId: job.id,
+      chunks,
+      totalPages,
+      voiceId,
+      selectedEmotion,
+    });
+
+    // @ts-ignore - EdgeRuntime متاح في Supabase Edge Runtime
+    if (typeof EdgeRuntime !== 'undefined' && EdgeRuntime.waitUntil) {
+      // @ts-ignore
+      EdgeRuntime.waitUntil(backgroundTask);
+    } else {
+      // fallback: لا تنتظر النتيجة، فقط أطلق المهمة
+      backgroundTask.catch(err => console.error('Background task failed:', err));
+    }
+
+    return respond({
+      success: true,
+      ok: true,
+      jobId: job.id,
+      status: 'processing',
+      totalPages,
+      language,
+      voiceId,
+      message: 'بدأ التحويل في الخلفية. تابع التقدم من حالة المهمة.',
+    });
+  } catch (error) {
+    console.error('Generate audiobook error:', error);
+    return respond({
+      ok: false,
+      success: false,
+      error: error instanceof Error ? error.message : 'Unknown error',
+    });
+  }
+});
+
+// ============================================================
+// Background processing function
+// ============================================================
+interface BackgroundTaskParams {
+  supabase: any;
+  MISTRAL_API_KEY: string;
+  bookId: string;
+  jobId: string;
+  chunks: string[];
+  totalPages: number;
+  voiceId: string;
+  selectedEmotion?: MistralEmotion;
+}
+
+async function processAudiobookInBackground(params: BackgroundTaskParams) {
+  const { supabase, MISTRAL_API_KEY, bookId, jobId, chunks, totalPages, voiceId, selectedEmotion } = params;
+  let processedCount = 0;
+  const errors: string[] = [];
+
+  try {
 
     for (let i = 0; i < chunks.length; i++) {
       const chunk = chunks[i];
