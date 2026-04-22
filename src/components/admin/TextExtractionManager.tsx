@@ -91,13 +91,13 @@ const TextExtractionManager: React.FC = () => {
     fetchBooks();
   }, []);
 
-  const extractText = async (bookId: string): Promise<{ ok: boolean; error?: string }> => {
+  const extractText = async (bookId: string): Promise<{ ok: boolean; error?: string; textLength?: number }> => {
     try {
-      const { data, error } = await supabaseFunctions.functions.invoke('extract-book-text', {
+      const { data, error } = await supabase.functions.invoke('extract-book-text', {
         body: { bookId, bookTable: 'approved_books' }
       });
       if (error) throw error;
-      if (data?.success) return { ok: true };
+      if (data?.success && data?.textLength > 0) return { ok: true, textLength: data.textLength };
       return { ok: false, error: data?.error || 'فشل الاستخراج' };
     } catch (err) {
       return { ok: false, error: err instanceof Error ? err.message : 'خطأ غير متوقع' };
@@ -108,7 +108,7 @@ const TextExtractionManager: React.FC = () => {
     setProcessingBookId(bookId);
     const res = await extractText(bookId);
     if (res.ok) {
-      toast({ title: 'تم استخراج النص بنجاح' });
+      toast({ title: 'تم استخراج النص بنجاح', description: `${res.textLength?.toLocaleString() || 0} حرف` });
       fetchBooks();
     } else {
       toast({ title: 'خطأ في استخراج النص', description: res.error, variant: 'destructive' });

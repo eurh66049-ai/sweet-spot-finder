@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent } from '@/components/ui/card';
 import { Badge } from '@/components/ui/badge';
@@ -67,7 +67,7 @@ const AudiobookManager: React.FC = () => {
     setTestAudioUrl(null);
     setTestDiagnostics(null);
     try {
-      const { data, error } = await supabaseFunctions.functions.invoke('generate-audiobook', {
+      const { data, error } = await supabase.functions.invoke('generate-audiobook', {
         body: {
           action: 'test',
           text: testText,
@@ -108,7 +108,7 @@ const AudiobookManager: React.FC = () => {
   const fetchVoices = async () => {
     setVoicesLoading(true);
     try {
-      const { data, error } = await supabaseFunctions.functions.invoke('generate-audiobook', {
+      const { data, error } = await supabase.functions.invoke('generate-audiobook', {
         body: { action: 'voices' },
       });
 
@@ -193,23 +193,41 @@ const AudiobookManager: React.FC = () => {
   }, []);
 
   // 🔄 Polling تلقائي لتحديث تقدم الكتب قيد المعالجة كل 3 ثوانٍ
+  const pollingRef = useRef(false);
+
   useEffect(() => {
     const hasProcessing = books.some(b => b.audiobook_status === 'processing');
     if (!hasProcessing) return;
 
     const interval = setInterval(async () => {
+      if (pollingRef.current) return;
+      pollingRef.current = true;
       const processingIds = books
         .filter(b => b.audiobook_status === 'processing')
         .map(b => b.id);
 
-      if (processingIds.length === 0) return;
+      if (processingIds.length === 0) {
+        pollingRef.current = false;
+        return;
+      }
+
+      await Promise.allSettled(
+        processingIds.map((bookId) =>
+          supabase.functions.invoke('generate-audiobook', {
+            body: { bookId, action: 'process-next', voice: selectedVoice, emotion: selectedEmotion },
+          })
+        )
+      );
 
       const { data: jobs } = await supabase
         .from('audiobook_jobs')
         .select('book_id, status, processed_pages, total_pages, error_message')
         .in('book_id', processingIds);
 
-      if (!jobs) return;
+      if (!jobs) {
+        pollingRef.current = false;
+        return;
+      }
 
       const jobMap = new Map(jobs.map(j => [j.book_id, j]));
 
@@ -232,15 +250,16 @@ const AudiobookManager: React.FC = () => {
           audiobook_error: job.error_message || null,
         };
       }));
+      pollingRef.current = false;
     }, 3000);
 
     return () => clearInterval(interval);
-  }, [books, toast]);
+  }, [books, selectedEmotion, selectedVoice, toast]);
 
   const generateAudiobook = async (bookId: string) => {
     setProcessingBookId(bookId);
     try {
-      const { data, error } = await supabaseFunctions.functions.invoke('generate-audiobook', {
+      const { data, error } = await supabase.functions.invoke('generate-audiobook', {
         body: { bookId, action: 'start', voice: selectedVoice, emotion: selectedEmotion },
       });
 
