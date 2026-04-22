@@ -9,6 +9,7 @@ import { Loader2, FileText, Search, CheckCircle, XCircle, RefreshCw, Eye, Play, 
 import { supabase, supabaseFunctions } from '@/integrations/supabase/client';
 import { useToast } from '@/hooks/use-toast';
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from '@/components/ui/dialog';
+import { Checkbox } from '@/components/ui/checkbox';
 
 interface BookWithExtraction {
   id: string;
@@ -28,6 +29,8 @@ const TextExtractionManager: React.FC = () => {
   const [loading, setLoading] = useState(true);
   const [searchQuery, setSearchQuery] = useState('');
   const [processingBookId, setProcessingBookId] = useState<string | null>(null);
+  const [processingBookIds, setProcessingBookIds] = useState<Set<string>>(new Set());
+  const [selectedBookIds, setSelectedBookIds] = useState<Set<string>>(new Set());
   const [viewText, setViewText] = useState<{ bookTitle: string; text: string } | null>(null);
 
   // Bulk extraction state
@@ -116,11 +119,33 @@ const TextExtractionManager: React.FC = () => {
     setProcessingBookId(null);
   };
 
-  // === استخراج تلقائي لكل الكتب الناقصة ===
+  const selectableBooks = useMemo(
+    () => books.filter(b => b.extraction_status !== 'completed' && b.book_file_url),
+    [books]
+  );
+
+  const selectFirst500Pending = () => {
+    setSelectedBookIds(new Set(selectableBooks.slice(0, 500).map(book => book.id)));
+  };
+
+  const clearSelection = () => {
+    setSelectedBookIds(new Set());
+  };
+
+  const toggleBookSelection = (bookId: string, checked: boolean) => {
+    setSelectedBookIds(prev => {
+      const next = new Set(prev);
+      if (checked) next.add(bookId);
+      else next.delete(bookId);
+      return next;
+    });
+  };
+
+  // === استخراج متوازي للكتب المحددة أو لكل الكتب الناقصة ===
   const startBulkExtraction = async () => {
-    const pending = books.filter(
-      b => b.extraction_status !== 'completed' && b.book_file_url
-    );
+    const pending = selectedBookIds.size > 0
+      ? selectableBooks.filter(book => selectedBookIds.has(book.id))
+      : selectableBooks;
 
     if (pending.length === 0) {
       toast({ title: 'لا توجد كتب بحاجة للاستخراج', description: 'جميع الكتب مستخرجة مسبقاً' });
@@ -133,33 +158,28 @@ const TextExtractionManager: React.FC = () => {
 
     let done = 0;
     let failed = 0;
+    setProcessingBookIds(new Set(pending.map(book => book.id)));
 
-    for (const book of pending) {
-      // إيقاف كامل
-      if ((bulkStateRef.current as BulkState) === 'idle') break;
-
-      // انتظار في حالة الإيقاف المؤقت
-      while ((bulkStateRef.current as BulkState) === 'paused') {
-        await new Promise(r => setTimeout(r, 500));
-      }
-      if ((bulkStateRef.current as BulkState) === 'idle') break;
-
-      setBulkProgress(p => ({ ...p, currentTitle: book.title }));
-      setProcessingBookId(book.id);
-
-      const res = await extractText(book.id);
-      if (res.ok) done++;
-      else failed++;
-
-      setBulkProgress({ done: done + failed, total: pending.length, failed, currentTitle: book.title });
-      setProcessingBookId(null);
-
-      // فاصل صغير لتجنب rate limits
-      await new Promise(r => setTimeout(r, 800));
-    }
+    await Promise.all(
+      pending.map(async (book) => {
+        if ((bulkStateRef.current as BulkState) === 'idle') return;
+        setBulkProgress(p => ({ ...p, currentTitle: book.title }));
+        const res = await extractText(book.id);
+        if (res.ok) done++;
+        else failed++;
+        setProcessingBookIds(prev => {
+          const next = new Set(prev);
+          next.delete(book.id);
+          return next;
+        });
+        setBulkProgress({ done: done + failed, total: pending.length, failed, currentTitle: book.title });
+      })
+    );
 
     bulkStateRef.current = 'idle';
     setBulkState('idle');
+    setProcessingBookIds(new Set());
+    setSelectedBookIds(new Set());
     toast({
       title: 'اكتمل الاستخراج التلقائي',
       description: `نجح: ${done} | فشل: ${failed}`,
@@ -181,6 +201,7 @@ const TextExtractionManager: React.FC = () => {
     bulkStateRef.current = 'idle';
     setBulkState('idle');
     setProcessingBookId(null);
+    setProcessingBookIds(new Set());
   };
 
   const viewExtractedText = async (bookId: string, bookTitle: string) => {
