@@ -72,6 +72,10 @@ const TextExtractionManager: React.FC = () => {
           text_length: ext?.text_length || null,
           extraction_error: ext?.extraction_error || null,
         };
+      }).sort((a, b) => {
+        const aCompleted = a.extraction_status === 'completed' ? 1 : 0;
+        const bCompleted = b.extraction_status === 'completed' ? 1 : 0;
+        return aCompleted - bCompleted;
       });
 
       setBooks(booksWithExtraction);
