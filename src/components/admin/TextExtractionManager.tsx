@@ -5,6 +5,7 @@ import { Card, CardContent } from '@/components/ui/card';
 import { Badge } from '@/components/ui/badge';
 import { Input } from '@/components/ui/input';
 import { Progress } from '@/components/ui/progress';
+import { Checkbox } from '@/components/ui/checkbox';
 import { Loader2, FileText, Search, CheckCircle, XCircle, RefreshCw, Eye, Play, Pause, Square, Zap } from 'lucide-react';
 import { supabase, supabaseFunctions } from '@/integrations/supabase/client';
 import { useToast } from '@/hooks/use-toast';
@@ -29,6 +30,7 @@ const TextExtractionManager: React.FC = () => {
   const [searchQuery, setSearchQuery] = useState('');
   const [processingBookId, setProcessingBookId] = useState<string | null>(null);
   const [viewText, setViewText] = useState<{ bookTitle: string; text: string } | null>(null);
+  const [selectedBookIds, setSelectedBookIds] = useState<Set<string>>(new Set());
 
   // Bulk extraction state
   const [bulkState, setBulkState] = useState<BulkState>('idle');
@@ -116,25 +118,15 @@ const TextExtractionManager: React.FC = () => {
     setProcessingBookId(null);
   };
 
-  // === استخراج تلقائي لكل الكتب الناقصة ===
-  const startBulkExtraction = async () => {
-    const pending = books.filter(
-      b => b.extraction_status !== 'completed' && b.book_file_url
-    );
-
-    if (pending.length === 0) {
-      toast({ title: 'لا توجد كتب بحاجة للاستخراج', description: 'جميع الكتب مستخرجة مسبقاً' });
-      return;
-    }
-
+  const runBulkExtraction = async (targetBooks: BookWithExtraction[], successTitle: string) => {
     bulkStateRef.current = 'running';
     setBulkState('running');
-    setBulkProgress({ done: 0, total: pending.length, failed: 0, currentTitle: '' });
+    setBulkProgress({ done: 0, total: targetBooks.length, failed: 0, currentTitle: '' });
 
     let done = 0;
     let failed = 0;
 
-    for (const book of pending) {
+    for (const book of targetBooks) {
       // إيقاف كامل
       if ((bulkStateRef.current as BulkState) === 'idle') break;
 
@@ -151,7 +143,7 @@ const TextExtractionManager: React.FC = () => {
       if (res.ok) done++;
       else failed++;
 
-      setBulkProgress({ done: done + failed, total: pending.length, failed, currentTitle: book.title });
+      setBulkProgress({ done: done + failed, total: targetBooks.length, failed, currentTitle: book.title });
       setProcessingBookId(null);
 
       // فاصل صغير لتجنب rate limits
@@ -160,11 +152,26 @@ const TextExtractionManager: React.FC = () => {
 
     bulkStateRef.current = 'idle';
     setBulkState('idle');
+    setSelectedBookIds(new Set());
     toast({
-      title: 'اكتمل الاستخراج التلقائي',
+      title: successTitle,
       description: `نجح: ${done} | فشل: ${failed}`,
     });
     fetchBooks();
+  };
+
+  // === استخراج تلقائي لكل الكتب الناقصة ===
+  const startBulkExtraction = async () => {
+    const pending = books.filter(
+      b => b.extraction_status !== 'completed' && b.book_file_url
+    );
+
+    if (pending.length === 0) {
+      toast({ title: 'لا توجد كتب بحاجة للاستخراج', description: 'جميع الكتب مستخرجة مسبقاً' });
+      return;
+    }
+
+    await runBulkExtraction(pending, 'اكتمل الاستخراج التلقائي');
   };
 
   const pauseBulk = () => {
