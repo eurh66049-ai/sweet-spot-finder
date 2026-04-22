@@ -192,6 +192,51 @@ const AudiobookManager: React.FC = () => {
     fetchVoices();
   }, []);
 
+  // 🔄 Polling تلقائي لتحديث تقدم الكتب قيد المعالجة كل 3 ثوانٍ
+  useEffect(() => {
+    const hasProcessing = books.some(b => b.audiobook_status === 'processing');
+    if (!hasProcessing) return;
+
+    const interval = setInterval(async () => {
+      const processingIds = books
+        .filter(b => b.audiobook_status === 'processing')
+        .map(b => b.id);
+
+      if (processingIds.length === 0) return;
+
+      const { data: jobs } = await supabase
+        .from('audiobook_jobs')
+        .select('book_id, status, processed_pages, total_pages, error_message')
+        .in('book_id', processingIds);
+
+      if (!jobs) return;
+
+      const jobMap = new Map(jobs.map(j => [j.book_id, j]));
+
+      setBooks(prev => prev.map(b => {
+        const job = jobMap.get(b.id);
+        if (!job) return b;
+        const wasProcessing = b.audiobook_status === 'processing';
+        const nowDone = job.status === 'completed' || job.status === 'completed_with_errors';
+        if (wasProcessing && nowDone) {
+          toast({
+            title: 'اكتمل تحويل الكتاب الصوتي ✅',
+            description: `${job.processed_pages}/${job.total_pages} جزء`,
+          });
+        }
+        return {
+          ...b,
+          audiobook_status: job.status,
+          audiobook_progress: job.processed_pages || 0,
+          audiobook_total: job.total_pages || 0,
+          audiobook_error: job.error_message || null,
+        };
+      }));
+    }, 3000);
+
+    return () => clearInterval(interval);
+  }, [books, toast]);
+
   const generateAudiobook = async (bookId: string) => {
     setProcessingBookId(bookId);
     try {
@@ -202,13 +247,18 @@ const AudiobookManager: React.FC = () => {
       if (error) throw error;
 
       if (data?.success) {
+        // ✅ المهمة تعمل في الخلفية - نُحدّث الحالة محلياً ليبدأ polling
+        setBooks(prev => prev.map(b =>
+          b.id === bookId
+            ? { ...b, audiobook_status: 'processing', audiobook_progress: 0, audiobook_total: data.totalPages || 0, audiobook_error: null }
+            : b
+        ));
         toast({
-          title: 'تم إنشاء الكتاب الصوتي',
-          description: `تم تحويل ${data.processedPages}/${data.totalPages} جزء بنجاح (${data.language === 'ar' ? 'عربي' : 'إنجليزي'})`,
+          title: 'بدأ التحويل في الخلفية ⏳',
+          description: `${data.totalPages} جزء — تتبع التقدم في الشريط أدناه`,
         });
-        fetchBooks();
       } else {
-        throw new Error(data?.error || 'فشل في إنشاء الكتاب الصوتي');
+        throw new Error(data?.error || 'فشل في بدء التحويل');
       }
     } catch (err) {
       console.error('Audiobook generation error:', err);

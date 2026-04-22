@@ -6,6 +6,68 @@ const corsHeaders = {
   'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type, x-supabase-client-platform, x-supabase-client-platform-version, x-supabase-client-runtime, x-supabase-client-runtime-version',
 };
 
+const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
+
+/**
+ * Call Mistral OCR with automatic retry/backoff for 429 (rate limit) and 5xx errors.
+ * Retries: 1s → 3s → 7s → 15s → 30s (exponential backoff)
+ */
+async function callMistralOcrWithRetry(
+  apiKey: string,
+  body: Record<string, unknown>,
+  maxRetries = 5
+): Promise<{ ok: boolean; data?: any; error?: string; status?: number }> {
+  const delays = [1000, 3000, 7000, 15000, 30000];
+
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    try {
+      const response = await fetch('https://api.mistral.ai/v1/ocr', {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${apiKey}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify(body),
+      });
+
+      if (response.ok) {
+        const data = await response.json();
+        return { ok: true, data, status: response.status };
+      }
+
+      const errorText = await response.text();
+      const isRetryable = response.status === 429 || response.status >= 500;
+
+      if (!isRetryable || attempt === maxRetries) {
+        return {
+          ok: false,
+          error: `Mistral OCR error: ${response.status} - ${errorText.substring(0, 200)}`,
+          status: response.status,
+        };
+      }
+
+      // Honor Retry-After header if present, otherwise use backoff
+      const retryAfterHeader = response.headers.get('retry-after');
+      const retryAfterMs = retryAfterHeader
+        ? parseInt(retryAfterHeader) * 1000
+        : delays[attempt];
+
+      console.log(`⏳ Mistral ${response.status} - retrying in ${retryAfterMs}ms (attempt ${attempt + 1}/${maxRetries})`);
+      await sleep(retryAfterMs);
+    } catch (err) {
+      if (attempt === maxRetries) {
+        return {
+          ok: false,
+          error: `Network error: ${err instanceof Error ? err.message : 'Unknown'}`,
+        };
+      }
+      await sleep(delays[attempt]);
+    }
+  }
+
+  return { ok: false, error: 'Max retries exhausted' };
+}
+
 serve(async (req) => {
   if (req.method === 'OPTIONS') {
     return new Response(null, { headers: corsHeaders });
@@ -61,45 +123,29 @@ serve(async (req) => {
     if (documentUrl) {
       console.log(`📄 Running Mistral OCR on document: ${documentUrl.substring(0, 100)}...`);
 
-      try {
-        const ocrResponse = await fetch('https://api.mistral.ai/v1/ocr', {
-          method: 'POST',
-          headers: {
-            'Authorization': `Bearer ${MISTRAL_API_KEY}`,
-            'Content-Type': 'application/json',
-          },
-          body: JSON.stringify({
-            model: 'mistral-ocr-latest',
-            document: {
-              type: 'document_url',
-              document_url: documentUrl,
-            },
-            include_image_base64: false,
-            image_limit: 0,
-          }),
-        });
+      const result = await callMistralOcrWithRetry(MISTRAL_API_KEY, {
+        model: 'mistral-ocr-latest',
+        document: {
+          type: 'document_url',
+          document_url: documentUrl,
+        },
+        include_image_base64: false,
+        image_limit: 0,
+      });
 
-        if (!ocrResponse.ok) {
-          const errorText = await ocrResponse.text();
-          console.error('Mistral OCR error:', ocrResponse.status, errorText);
-          errors.push(`Mistral OCR error: ${ocrResponse.status} - ${errorText.substring(0, 200)}`);
-        } else {
-          const ocrData = await ocrResponse.json();
-          const pages = ocrData.pages || [];
-
-          for (const page of pages) {
-            const pageText = page.markdown || page.text || '';
-            if (pageText.trim()) {
-              processedPages++;
-              allText += `\n--- صفحة ${processedPages} ---\n${pageText}\n`;
-            }
+      if (!result.ok) {
+        console.error('Mistral OCR failed after retries:', result.error);
+        errors.push(result.error || 'OCR failed');
+      } else {
+        const pages = result.data?.pages || [];
+        for (const page of pages) {
+          const pageText = page.markdown || page.text || '';
+          if (pageText.trim()) {
+            processedPages++;
+            allText += `\n--- صفحة ${processedPages} ---\n${pageText}\n`;
           }
-
-          console.log(`✅ Mistral OCR: extracted ${processedPages} pages, ${allText.length} chars`);
         }
-      } catch (ocrError) {
-        console.error('OCR request failed:', ocrError);
-        errors.push(`OCR request failed: ${ocrError instanceof Error ? ocrError.message : 'Unknown'}`);
+        console.log(`✅ Mistral OCR: extracted ${processedPages} pages, ${allText.length} chars`);
       }
     }
 
@@ -110,42 +156,31 @@ serve(async (req) => {
       console.log(`🖼️ Fallback: running Mistral OCR on ${imagesToProcess.length} image(s)`);
 
       for (const imageUrl of imagesToProcess) {
-        try {
-          const ocrResponse = await fetch('https://api.mistral.ai/v1/ocr', {
-            method: 'POST',
-            headers: {
-              'Authorization': `Bearer ${MISTRAL_API_KEY}`,
-              'Content-Type': 'application/json',
-            },
-            body: JSON.stringify({
-              model: 'mistral-ocr-latest',
-              document: {
-                type: 'image_url',
-                image_url: imageUrl,
-              },
-              include_image_base64: false,
-            }),
-          });
+        const result = await callMistralOcrWithRetry(MISTRAL_API_KEY, {
+          model: 'mistral-ocr-latest',
+          document: {
+            type: 'image_url',
+            image_url: imageUrl,
+          },
+          include_image_base64: false,
+        });
 
-          if (!ocrResponse.ok) {
-            const errorText = await ocrResponse.text();
-            errors.push(`Image OCR error: ${ocrResponse.status}`);
-            console.error('Mistral OCR image error:', errorText);
-            continue;
-          }
-
-          const ocrData = await ocrResponse.json();
-          const pages = ocrData.pages || [];
-          for (const page of pages) {
-            const pageText = page.markdown || page.text || '';
-            if (pageText.trim()) {
-              processedPages++;
-              allText += `\n--- صفحة ${processedPages} ---\n${pageText}\n`;
-            }
-          }
-        } catch (imgError) {
-          errors.push(`Image OCR failed: ${imgError instanceof Error ? imgError.message : 'Unknown'}`);
+        if (!result.ok) {
+          errors.push(`Image OCR error: ${result.error}`);
+          continue;
         }
+
+        const pages = result.data?.pages || [];
+        for (const page of pages) {
+          const pageText = page.markdown || page.text || '';
+          if (pageText.trim()) {
+            processedPages++;
+            allText += `\n--- صفحة ${processedPages} ---\n${pageText}\n`;
+          }
+        }
+
+        // Small gap between image requests to be polite to the API
+        await sleep(500);
       }
     }
 
