@@ -260,11 +260,19 @@ const TextExtractionManager: React.FC = () => {
     ({ index, style, books: rowBooks }: RowComponentProps<{ books: BookWithExtraction[] }>) => {
       const book = rowBooks[index];
       if (!book) return null;
+      const isProcessing = processingBookId === book.id || processingBookIds.has(book.id);
+      const canSelect = book.extraction_status !== 'completed' && !!book.book_file_url;
       return (
         <div style={style} className="px-1 pb-3">
-          <Card className={`overflow-hidden ${processingBookId === book.id ? 'ring-2 ring-primary' : ''}`}>
+          <Card className={`overflow-hidden ${isProcessing ? 'ring-2 ring-primary' : ''}`}>
             <CardContent className="p-4">
               <div className="flex items-start gap-4">
+                <Checkbox
+                  checked={selectedBookIds.has(book.id)}
+                  disabled={!canSelect || bulkState !== 'idle'}
+                  onCheckedChange={(checked) => toggleBookSelection(book.id, checked === true)}
+                  className="mt-7"
+                />
                 <div className="w-16 h-20 flex-shrink-0 rounded overflow-hidden bg-muted">
                   {book.cover_image_url ? (
                     <img src={book.cover_image_url} alt={book.title} loading="lazy" decoding="async" className="w-full h-full object-cover" />
@@ -295,9 +303,9 @@ const TextExtractionManager: React.FC = () => {
                   <Button
                     size="sm"
                     onClick={() => handleSingleExtract(book.id)}
-                    disabled={processingBookId === book.id || bulkState !== 'idle'}
+                    disabled={isProcessing || bulkState !== 'idle'}
                   >
-                    {processingBookId === book.id ? (
+                    {isProcessing ? (
                       <Loader2 className="h-4 w-4 animate-spin" />
                     ) : (
                       <FileText className="h-4 w-4 ml-1" />
@@ -317,7 +325,7 @@ const TextExtractionManager: React.FC = () => {
         </div>
       );
     },
-    [processingBookId, bulkState]
+    [processingBookId, processingBookIds, selectedBookIds, bulkState]
   );
 
   if (loading) {
