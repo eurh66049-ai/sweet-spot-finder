@@ -190,6 +190,28 @@ const TextExtractionManager: React.FC = () => {
     setProcessingBookId(null);
   };
 
+  const toggleBookSelection = useCallback((bookId: string, checked: boolean) => {
+    setSelectedBookIds(prev => {
+      const next = new Set(prev);
+      if (checked) next.add(bookId);
+      else next.delete(bookId);
+      return next;
+    });
+  }, []);
+
+  const startSelectedExtraction = async () => {
+    const selectedBooks = books.filter(
+      b => selectedBookIds.has(b.id) && b.extraction_status !== 'completed' && b.book_file_url
+    );
+
+    if (selectedBooks.length === 0) {
+      toast({ title: 'اختر كتباً غير مستخرجة أولاً', variant: 'destructive' });
+      return;
+    }
+
+    await runBulkExtraction(selectedBooks, 'اكتمل استخراج الكتب المختارة');
+  };
+
   const viewExtractedText = async (bookId: string, bookTitle: string) => {
     try {
       const { data, error } = await supabase
@@ -226,6 +248,10 @@ const TextExtractionManager: React.FC = () => {
   const completedCount = useMemo(
     () => books.filter(b => b.extraction_status === 'completed').length,
     [books]
+  );
+  const selectedPendingCount = useMemo(
+    () => books.filter(b => selectedBookIds.has(b.id) && b.extraction_status !== 'completed' && b.book_file_url).length,
+    [books, selectedBookIds]
   );
 
   const getStatusBadge = (status: string | null) => {
