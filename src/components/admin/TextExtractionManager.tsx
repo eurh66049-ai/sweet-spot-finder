@@ -357,10 +357,20 @@ const TextExtractionManager: React.FC = () => {
 
             <div className="flex gap-2 flex-wrap">
               {bulkState === 'idle' && (
-                <Button onClick={startBulkExtraction} disabled={pendingCount === 0} size="sm">
-                  <Play className="h-4 w-4 ml-1" />
-                  استخراج الكل ({pendingCount})
-                </Button>
+                <>
+                  <Button onClick={selectFirst500Pending} disabled={selectableBooks.length === 0} variant="outline" size="sm">
+                    تحديد 500 كتاب
+                  </Button>
+                  {selectedBookIds.size > 0 && (
+                    <Button onClick={clearSelection} variant="outline" size="sm">
+                      إلغاء التحديد ({selectedBookIds.size})
+                    </Button>
+                  )}
+                  <Button onClick={startBulkExtraction} disabled={pendingCount === 0} size="sm">
+                    <Play className="h-4 w-4 ml-1" />
+                    {selectedBookIds.size > 0 ? `استخراج المحدد (${selectedBookIds.size})` : `استخراج الكل (${pendingCount})`}
+                  </Button>
+                </>
               )}
               {bulkState === 'running' && (
                 <>
