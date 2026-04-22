@@ -277,14 +277,23 @@ const TextExtractionManager: React.FC = () => {
           <Card className={`overflow-hidden ${processingBookId === book.id ? 'ring-2 ring-primary' : ''}`}>
             <CardContent className="p-4">
               <div className="flex items-start gap-4">
-                <div className="w-16 h-20 flex-shrink-0 rounded overflow-hidden bg-muted">
-                  {book.cover_image_url ? (
-                    <img src={book.cover_image_url} alt={book.title} loading="lazy" decoding="async" className="w-full h-full object-cover" />
-                  ) : (
-                    <div className="w-full h-full flex items-center justify-center">
-                      <FileText className="h-6 w-6 text-muted-foreground" />
-                    </div>
-                  )}
+                <div className="flex items-start gap-3 flex-shrink-0">
+                  <Checkbox
+                    checked={selectedBookIds.has(book.id)}
+                    disabled={book.extraction_status === 'completed' || !book.book_file_url || bulkState !== 'idle'}
+                    onCheckedChange={(checked) => toggleBookSelection(book.id, checked === true)}
+                    aria-label={`اختيار ${book.title}`}
+                    className="mt-1"
+                  />
+                  <div className="w-16 h-20 rounded overflow-hidden bg-muted">
+                    {book.cover_image_url ? (
+                      <img src={book.cover_image_url} alt={book.title} loading="lazy" decoding="async" className="w-full h-full object-cover" />
+                    ) : (
+                      <div className="w-full h-full flex items-center justify-center">
+                        <FileText className="h-6 w-6 text-muted-foreground" />
+                      </div>
+                    )}
+                  </div>
                 </div>
 
                 <div className="flex-1 min-w-0">
@@ -329,7 +338,7 @@ const TextExtractionManager: React.FC = () => {
         </div>
       );
     },
-    [processingBookId, bulkState]
+    [processingBookId, bulkState, selectedBookIds, toggleBookSelection]
   );
 
   if (loading) {
