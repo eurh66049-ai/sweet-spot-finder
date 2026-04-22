@@ -370,10 +370,16 @@ const TextExtractionManager: React.FC = () => {
 
             <div className="flex gap-2 flex-wrap">
               {bulkState === 'idle' && (
-                <Button onClick={startBulkExtraction} disabled={pendingCount === 0} size="sm">
-                  <Play className="h-4 w-4 ml-1" />
-                  استخراج الكل ({pendingCount})
-                </Button>
+                <>
+                  <Button onClick={startSelectedExtraction} disabled={selectedPendingCount === 0} size="sm" variant="outline">
+                    <FileText className="h-4 w-4 ml-1" />
+                    استخراج المختارة ({selectedPendingCount})
+                  </Button>
+                  <Button onClick={startBulkExtraction} disabled={pendingCount === 0} size="sm">
+                    <Play className="h-4 w-4 ml-1" />
+                    استخراج الكل ({pendingCount})
+                  </Button>
+                </>
               )}
               {bulkState === 'running' && (
                 <>
