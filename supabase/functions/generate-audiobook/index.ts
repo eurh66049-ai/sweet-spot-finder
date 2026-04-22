@@ -556,7 +556,7 @@ async function processAudiobookInBackground(params: BackgroundTaskParams) {
             current_step: `converting_page_${pageNum}_of_${totalPages}`,
             updated_at: new Date().toISOString(),
           })
-          .eq('id', job.id);
+          .eq('id', jobId);
 
       } catch (chunkError) {
         console.error(`Error processing chunk ${pageNum}:`, chunkError);
@@ -577,28 +577,22 @@ async function processAudiobookInBackground(params: BackgroundTaskParams) {
         error_message: errors.length > 0 ? errors.join('; ') : null,
         updated_at: new Date().toISOString(),
       })
-      .eq('id', job.id);
+      .eq('id', jobId);
 
     console.log(`✅ Audiobook generation ${finalStatus}: ${processedCount}/${totalPages} chunks processed`);
-
-    return respond({
-      success: true,
-      ok: true,
-      jobId: job.id,
-      status: finalStatus,
-      processedPages: processedCount,
-      totalPages,
-      language,
-      voiceId,
-      errors: errors.length > 0 ? errors : undefined,
-    });
-
-  } catch (error) {
-    console.error('Generate audiobook error:', error);
-    return respond({
-      ok: false,
-      success: false,
-      error: error instanceof Error ? error.message : 'Unknown error',
-    });
+  } catch (bgError) {
+    console.error('❌ Background audiobook task failed:', bgError);
+    await supabase
+      .from('audiobook_jobs')
+      .update({
+        status: 'failed',
+        current_step: 'error',
+        processed_pages: processedCount,
+        error_message: bgError instanceof Error ? bgError.message : 'Unknown background error',
+        completed_at: new Date().toISOString(),
+        updated_at: new Date().toISOString(),
+      })
+      .eq('id', jobId);
   }
-});
+}
+
