@@ -405,6 +405,24 @@ const PDFJSReader = () => {
     void document.exitFullscreen();
   };
 
+  // Load existing extracted text on mount so Read Aloud works without re-running OCR
+  useEffect(() => {
+    if (!book?.id) return;
+    let cancelled = false;
+    (async () => {
+      const { data } = await supabase
+        .from('book_extracted_text')
+        .select('extracted_text, extraction_status')
+        .eq('book_id', book.id)
+        .maybeSingle();
+      if (cancelled) return;
+      if (data?.extracted_text && data.extraction_status === 'completed') {
+        setPdfTextContent(data.extracted_text);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [book?.id]);
+
   const handleExtractBookText = useCallback(async () => {
     if (!book?.id || ocrLoading) return;
     setOcrLoading(true);
@@ -422,7 +440,7 @@ const PDFJSReader = () => {
         .from('book_extracted_text')
         .select('extracted_text')
         .eq('book_id', book.id)
-        .single();
+        .maybeSingle();
 
       if (extracted?.extracted_text) {
         setPdfTextContent(extracted.extracted_text);
@@ -435,32 +453,110 @@ const PDFJSReader = () => {
     }
   }, [book?.id, ocrLoading]);
 
+  // Ensure speech voices are loaded (Chrome loads them async)
+  const ensureVoicesLoaded = useCallback((): Promise<SpeechSynthesisVoice[]> => {
+    return new Promise((resolve) => {
+      const existing = window.speechSynthesis.getVoices();
+      if (existing && existing.length > 0) {
+        resolve(existing);
+        return;
+      }
+      let resolved = false;
+      const handler = () => {
+        if (resolved) return;
+        resolved = true;
+        resolve(window.speechSynthesis.getVoices());
+      };
+      window.speechSynthesis.addEventListener('voiceschanged', handler, { once: true });
+      // Safety timeout — some browsers never fire the event
+      setTimeout(() => {
+        if (resolved) return;
+        resolved = true;
+        resolve(window.speechSynthesis.getVoices() || []);
+      }, 1500);
+    });
+  }, []);
+
   const handleReadAloud = useCallback(async () => {
+    if (typeof window === 'undefined' || !('speechSynthesis' in window)) {
+      toast.error('المتصفح لا يدعم القراءة الصوتية');
+      return;
+    }
+
     if (readingAloud) {
       window.speechSynthesis.cancel();
       setReadingAloud(false);
       return;
     }
 
+    // Resolve text source: cached extracted text → DB → current page text layer
     let textToRead = pdfTextContent.trim();
+
+    if (!textToRead && book?.id) {
+      const { data: dbText } = await supabase
+        .from('book_extracted_text')
+        .select('extracted_text')
+        .eq('book_id', book.id)
+        .maybeSingle();
+      if (dbText?.extracted_text) {
+        textToRead = dbText.extracted_text.trim();
+        setPdfTextContent(dbText.extracted_text);
+      }
+    }
+
     if (!textToRead) {
       textToRead = (await getPagesText([currentVisiblePage, currentVisiblePage + 1])).trim();
     }
 
     if (!textToRead) {
-      toast.error('لا يوجد نص جاهز للقراءة حالياً، جرّب OCR أولاً');
+      toast.error('لا يوجد نص جاهز للقراءة، اضغط زر استخراج النص (OCR) أولاً');
       return;
     }
 
-    const utterance = new SpeechSynthesisUtterance(textToRead.slice(0, 5000));
-    utterance.lang = /[\u0600-\u06FF]/.test(textToRead) ? 'ar-SA' : 'en-US';
-    utterance.rate = 0.95;
-    utterance.onend = () => setReadingAloud(false);
-    utterance.onerror = () => setReadingAloud(false);
+    // Strip page markers from extracted text
+    const cleanText = textToRead
+      .replace(/---\s*صفحة\s*\d+\s*---/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim();
+
+    const isArabic = /[\u0600-\u06FF]/.test(cleanText);
+    const lang = isArabic ? 'ar-SA' : 'en-US';
+
+    // Pre-load voices (required on Chrome/Edge to avoid silent failure)
+    const voices = await ensureVoicesLoaded();
+    const matchingVoice =
+      voices.find((v) => v.lang?.toLowerCase().startsWith(isArabic ? 'ar' : 'en')) || null;
+
+    if (isArabic && !matchingVoice) {
+      toast.warning('لم يتم العثور على صوت عربي في متصفحك، سيتم استخدام الصوت الافتراضي');
+    }
+
+    // Cancel any prior speech and start fresh
     window.speechSynthesis.cancel();
-    window.speechSynthesis.speak(utterance);
+
+    const utterance = new SpeechSynthesisUtterance(cleanText.slice(0, 5000));
+    utterance.lang = lang;
+    utterance.rate = 0.95;
+    if (matchingVoice) utterance.voice = matchingVoice;
+    utterance.onend = () => setReadingAloud(false);
+    utterance.onerror = (e) => {
+      console.error('TTS error:', e);
+      toast.error('تعذرت القراءة الصوتية');
+      setReadingAloud(false);
+    };
+
     setReadingAloud(true);
-  }, [currentVisiblePage, getPagesText, pdfTextContent, readingAloud]);
+    // Some browsers need a tick before speak() works after cancel()
+    setTimeout(() => {
+      try {
+        window.speechSynthesis.speak(utterance);
+      } catch (err) {
+        console.error('speak() failed:', err);
+        toast.error('فشل تشغيل القراءة الصوتية');
+        setReadingAloud(false);
+      }
+    }, 50);
+  }, [book?.id, currentVisiblePage, ensureVoicesLoaded, getPagesText, pdfTextContent, readingAloud]);
 
   const modeConfig = useMemo(() => getReadingModeConfig(readingMode), [readingMode]);
 
